@@ -103,7 +103,9 @@ class Config:
     cv_splits: int = 5
     cv_repeats: int = 5
 
-    num_workers: int = 0
+    # [PERF-02] Procesos que cargan y aumentan imágenes en paralelo con la GPU. Con 0 todo se
+    # hacía en el proceso principal y la GPU esperaba. Colab gratis tiene 2 CPU.
+    num_workers: int = field(default_factory=lambda: min(8, os.cpu_count() or 1))
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def save(self, path):
@@ -240,9 +242,52 @@ def _seed_worker(worker_id):
 def make_loader(df, arch, cfg, batch_size, train, seed=0):
     g = torch.Generator()
     g.manual_seed(seed)
+    # [PERF-02] persistent_workers: los procesos se crean una vez por loader, no en cada época.
     return DataLoader(ImageDataset(df, get_transform(arch, cfg, train)), batch_size=batch_size,
                       shuffle=train, num_workers=cfg.num_workers, worker_init_fn=_seed_worker,
-                      generator=g, pin_memory=cfg.device == 'cuda')
+                      generator=g, pin_memory=cfg.device == 'cuda',
+                      persistent_workers=cfg.num_workers > 0)
+
+
+def prepare_resized_images(cfg: Config, cache_dir: str, min_side: int | None = None,
+                           quality: int = 95) -> str:
+    """[PERF-01] Copia reducida de cfg.originals_dir en cache_dir, para no decodificar
+    imágenes de ~1080×1314 px en cada época. Devuelve cache_dir (asígnelo a cfg.originals_dir).
+
+    Cada imagen se reduce, con su relación de aspecto, hasta que su lado menor mida `min_side`
+    (por defecto el mayor tamaño de entrada en cfg.img_size, 480 px). Como después todo se lleva
+    a 224 o 480 px, el modelo ve casi lo mismo (no idéntico bit a bit: hay dos remuestreos).
+    Las imágenes que ya son más chicas se copian sin tocar. Solo procesa lo que falta, así que
+    volver a llamarla es instantáneo. Use un disco local (/content en Colab), no Drive.
+    """
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+
+    min_side = min_side or max(cfg.img_size.values())
+    os.makedirs(cache_dir, exist_ok=True)
+    names = [n for n in os.listdir(cfg.originals_dir)
+             if n.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    def one(name):
+        src, dst = os.path.join(cfg.originals_dir, name), os.path.join(cache_dir, name)
+        if os.path.exists(dst):
+            return 0
+        with Image.open(src) as im:
+            w, h = im.size
+            if min(w, h) <= min_side:
+                shutil.copy2(src, dst)
+                return 1
+            s = min_side / min(w, h)
+            im = im.convert('RGB').resize((round(w * s), round(h * s)), Image.BICUBIC)
+            im.save(dst + '.tmp', format='JPEG', quality=quality)
+        os.replace(dst + '.tmp', dst)  # una copia a medias nunca queda con el nombre final
+        return 1
+
+    with ThreadPoolExecutor(max_workers=max(2, os.cpu_count() or 1)) as ex:
+        done = sum(ex.map(one, names))
+    print(f'Imágenes reducidas (lado menor {min_side} px) en {cache_dir}: '
+          f'{done} nuevas, {len(names) - done} ya estaban')
+    return cache_dir
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +804,8 @@ def extract_embeddings(df: pd.DataFrame, key: str, cfg: Config, batch_size: int 
 
     def run(train):
         loader = DataLoader(ImageDataset(df, _embedding_transform(size, mean, std, cfg, train)),
-                            batch_size=batch_size, shuffle=False, num_workers=cfg.num_workers)
+                            batch_size=batch_size, shuffle=False, num_workers=cfg.num_workers,
+                            pin_memory=cfg.device == 'cuda')
         out = []
         for x, _ in loader:
             with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):

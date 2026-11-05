@@ -11,3 +11,6 @@ oasis/Stimulus set/OASIS.zip
 __pycache__/
 .DS_Store
 ~$*
+
+# Copia reducida de images_or (pl.prepare_resized_images)
+images_480/
