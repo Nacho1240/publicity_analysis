@@ -83,6 +83,12 @@ class Config:
     val_size: float = 0.15
     test_seed: int = 2024          # el conjunto de test es fijo para todas las semillas
     seeds: tuple = (0, 1, 2, 3, 4)  # [FIX-12] varias semillas → media ± IC95%
+    # [FIX-20] El dataset contiene imágenes repetidas (el mismo archivo con dos nombres). Si
+    # una copia cae en train y la otra en test hay fuga. Con group_duplicates=True todas las
+    # copias de una imagen quedan en la misma partición. Los pares están en duplicates_csv
+    # (generado con find_duplicates y revisado a mano).
+    group_duplicates: bool = True
+    duplicates_csv: str = 'duplicados.csv'
 
     # Optuna
     optuna_trials: int = 15
@@ -106,6 +112,18 @@ class Config:
     # [PERF-02] Procesos que cargan y aumentan imágenes en paralelo con la GPU. Con 0 todo se
     # hacía en el proceso principal y la GPU esperaba. Colab gratis tiene 2 CPU.
     num_workers: int = field(default_factory=lambda: min(8, os.cpu_count() or 1))
+    # [PERF-03] El backbone está congelado, así que sus features no cambian entre épocas, trials
+    # ni semillas: se calculan UNA vez por arquitectura (originales + feature_views vistas con la
+    # augmentation de la Tabla I) y las cabezas se entrenan sobre ellas. En cada época cada imagen
+    # de train aparece con una de sus vistas al azar. 7 vistas = las 7 variantes por imagen del
+    # artículo original, pero generadas después de partir (sin fuga). False = augmentation al vuelo.
+    cache_features: bool = True
+    feature_views: int = 7
+    # Los mapas de características (solo experimentos espaciales) ocupan varios GB: van a un
+    # disco local, no a Drive, y se recalculan en cada sesión (minutos en GPU).
+    local_cache_dir: str = 'cache_local'
+    # [PERF-04] Precisión mixta (fp16) en GPU: acelera el backbone 2-3x en una T4.
+    amp: bool = True
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def save(self, path):
@@ -153,7 +171,61 @@ def load_labels(cfg: Config) -> pd.DataFrame:
         raise FileNotFoundError(f'{len(missing)} imágenes del CSV no existen, p.ej. {missing[:5]}')
     if df['image'].duplicated().any():
         raise ValueError('Hay imágenes duplicadas en el CSV.')
-    return df.reset_index(drop=True)
+    df = df.reset_index(drop=True)
+    df['dup_group'] = _duplicate_groups(df, cfg)
+    return df
+
+
+def find_duplicates(df: pd.DataFrame, max_diff: float = 0.6, size: int = 32) -> pd.DataFrame:
+    """[FIX-20] Pares de imágenes con el mismo contenido: miniaturas RGB de size×size cuya
+    diferencia absoluta media es < max_diff (en niveles 0-255) y con la misma relación de
+    aspecto. Con 0.6 solo aparecen copias exactas o recomprimidas; con ~3 aparecen también
+    series de una misma campaña (misma plantilla, otro texto)."""
+    from scipy.spatial.distance import cdist
+    thumbs, ratio = [], []
+    for p in df['path']:
+        with Image.open(p) as im:
+            ratio.append(im.size[0] / im.size[1])
+            thumbs.append(np.asarray(im.convert('RGB').resize((size, size), Image.BILINEAR),
+                                     dtype=np.float32).ravel())
+    thumbs, ratio = np.stack(thumbs), np.asarray(ratio)
+    dist = cdist(thumbs, thumbs, 'cityblock') / thumbs.shape[1]
+    a, b = np.triu_indices(len(df), 1)
+    keep = (dist[a, b] < max_diff) & (np.abs(np.log(ratio[a] / ratio[b])) < 0.03)
+    a, b = a[keep], b[keep]
+    return pd.DataFrame({
+        'image_a': df['image'].values[a], 'image_b': df['image'].values[b],
+        'diff': dist[a, b].round(3),
+        'emotion_a': df['emotion'].values[a], 'emotion_b': df['emotion'].values[b],
+        'same_valence': df['label'].values[a] == df['label'].values[b],
+        'same_emotion': df['emotion'].values[a] == df['emotion'].values[b]})
+
+
+def _duplicate_groups(df: pd.DataFrame, cfg: Config) -> np.ndarray:
+    """Id de grupo por imagen: las copias de una misma imagen comparten id (componentes
+    conexas de los pares de cfg.duplicates_csv). Sin CSV, cada imagen es su propio grupo."""
+    group = np.arange(len(df))
+    if not (cfg.group_duplicates and os.path.exists(cfg.duplicates_csv)):
+        return group
+    pos = {img: i for i, img in enumerate(df['image'])}
+    pairs = pd.read_csv(cfg.duplicates_csv)
+    for a, b in zip(pairs['image_a'], pairs['image_b']):
+        if a in pos and b in pos:
+            ga, gb = group[pos[a]], group[pos[b]]
+            group[group == max(ga, gb)] = min(ga, gb)
+    return group
+
+
+def duplicate_agreement(pairs: pd.DataFrame) -> dict:
+    """Consistencia de las etiquetas medida en el propio dataset: de los pares de imágenes
+    idénticas, qué fracción recibió la misma valencia y la misma emoción. Es una cota empírica
+    del accuracy que puede alcanzar CUALQUIER modelo contra estas etiquetas."""
+    from scipy.stats import binomtest
+    n, k = len(pairs), int(pairs['same_valence'].sum())
+    ci = binomtest(k, n).proportion_ci(method='wilson') if n else (np.nan, np.nan)
+    return {'pairs': n, 'images': len(set(pairs['image_a']) | set(pairs['image_b'])),
+            'same_valence': k / n if n else np.nan, 'same_valence_ci95': (ci[0], ci[1]),
+            'same_emotion': pairs['same_emotion'].mean() if n else np.nan}
 
 
 def class_distribution(df: pd.DataFrame) -> pd.DataFrame:
@@ -175,8 +247,16 @@ def make_splits(df: pd.DataFrame, cfg: Config, seed: int) -> dict:
     rel_val = cfg.val_size / (1 - cfg.test_size)
     train, val = train_test_split(trainval, test_size=rel_val, stratify=trainval['label'],
                                   random_state=seed)
+    if cfg.group_duplicates and 'dup_group' in df and df['dup_group'].duplicated().any():
+        # [FIX-20] Todas las copias de una imagen van a la partición de mayor prioridad en la
+        # que cayó alguna (test > val > train). El resto de la partición no cambia.
+        part = pd.concat([test.assign(_p=2), val.assign(_p=1), train.assign(_p=0)])
+        part['_p'] = part.groupby('dup_group')['_p'].transform('max')
+        train, val, test = (part[part['_p'] == k].drop(columns='_p') for k in (0, 1, 2))
     splits = {'train': train.reset_index(drop=True), 'val': val.reset_index(drop=True),
               'test': test.reset_index(drop=True)}
+    assert not (set(splits['train'].dup_group) & set(splits['test'].dup_group)) \
+        if 'dup_group' in df else True
     assert not (set(splits['train'].image) & set(splits['test'].image))
     assert not (set(splits['train'].image) & set(splits['val'].image))
     return splits
@@ -443,6 +523,180 @@ def make_optimizer(name, params, lr):
 
 
 # ---------------------------------------------------------------------------
+# [PERF-03] Features precalculadas del backbone congelado
+# ---------------------------------------------------------------------------
+FEATURE_DIMS = {'resnet152': 2048, 'resnet50': 2048, 'efficientnet_v2_m': 1280}
+_FEATURES: dict = {}  # memoria de la sesión: (arch, meta) → features
+
+
+def uses_feature_cache(exp, cfg: Config) -> bool:
+    return cfg.cache_features and exp not in FINETUNE_EXPS
+
+
+def protocol_tag(exp, cfg: Config) -> str:
+    """Identifica cómo se entrenó un experimento, para no mezclar resultados guardados de
+    protocolos distintos: 'online' (augmentation al vuelo) o 'cacheV' (V vistas precalculadas)."""
+    return f'cache{cfg.feature_views}' if uses_feature_cache(exp, cfg) else 'online'
+
+
+def _feature_meta(arch: str, cfg: Config) -> str:
+    keys = ('feature_views', 'keep_full_image', 'rotation_deg', 'zoom', 'shift',
+            'horizontal_flip', 'vertical_flip', 'pretrained')
+    return json.dumps({'arch': arch, 'img_size': cfg.img_size[arch],
+                       **{k: getattr(cfg, k) for k in keys}}, sort_keys=True)
+
+
+@torch.no_grad()
+def extract_features(df: pd.DataFrame, arch: str, cfg: Config, need_maps: bool = False,
+                     batch_size: int = 64) -> dict:
+    """Pasa cada imagen por el backbone congelado UNA vez por vista y guarda el resultado.
+
+    Devuelve, alineados con las filas de `df`:
+      'X'      (N, C)       features con pooling de las imágenes originales (val/test),
+      'X_aug'  (V, N, C)    ídem para V = cfg.feature_views vistas con get_transform(train=True),
+      'maps'   (1+V, N, C, H, W) float16 en disco, solo si need_maps (experimentos espaciales);
+                            el índice 0 son las originales.
+    Las features con pooling se guardan en <output_dir>/features/ y se reutilizan si coinciden
+    la lista de imágenes y la configuración de augmentation; los mapas, en cfg.local_cache_dir.
+    """
+    meta, images = _feature_meta(arch, cfg), df['image'].to_numpy(dtype=str)
+    key = (arch, meta, cfg.output_dir)
+    hit = _FEATURES.get(key)
+    if hit is not None and hit['image'].tolist() == images.tolist() and \
+            (hit['maps'] is not None or not need_maps):
+        return hit
+
+    V = cfg.feature_views
+    pooled_path = os.path.join(cfg.output_dir, 'features', f'{arch}_v{V}.npz')
+    maps_path = os.path.join(cfg.local_cache_dir, f'{arch}_maps_v{V}.npy')
+    out = None
+    if os.path.exists(pooled_path):
+        c = np.load(pooled_path, allow_pickle=False)
+        if str(c['meta']) == meta and c['image'].tolist() == images.tolist():
+            out = {'X': c['X'], 'X_aug': c['X_aug'], 'maps': None, 'image': images}
+    if out is not None and need_maps and os.path.exists(maps_path + '.json'):
+        with open(maps_path + '.json', encoding='utf-8') as f:
+            done = json.load(f)
+        if done == {'meta': meta, 'image': images.tolist()}:
+            out['maps'] = np.load(maps_path, mmap_mode='r')
+    if out is not None and (out['maps'] is not None or not need_maps):
+        print(f'{arch}: features cargadas de {pooled_path}')
+        _FEATURES[key] = out
+        return out
+
+    features, dim = load_features(arch, cfg.pretrained)
+    features = features.to(cfg.device).eval()
+    use_amp = _amp(cfg, cfg.device)
+    N = len(df)
+    pooled = np.empty((1 + V, N, dim), dtype=np.float32)
+    maps = None
+    for v in range(1 + V):  # 0 = originales; 1..V = vistas aumentadas
+        set_seed(10_000 + v)
+        loader = make_loader(df, arch, cfg, batch_size, train=False, seed=10_000 + v)
+        loader.dataset.transform = get_transform(arch, cfg, train=v > 0)
+        i = 0
+        for x, _ in loader:
+            with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
+                f = features(x.to(cfg.device, dtype=torch.float32))
+            f = f.float()
+            if need_maps:
+                if maps is None:
+                    os.makedirs(cfg.local_cache_dir, exist_ok=True)
+                    if os.path.exists(maps_path + '.json'):
+                        os.remove(maps_path + '.json')  # el archivo deja de ser válido
+                    maps = np.lib.format.open_memmap(maps_path, mode='w+', dtype=np.float16,
+                                                     shape=(1 + V, N, *f.shape[1:]))
+                maps[v, i:i + len(x)] = f.cpu().numpy().astype(np.float16)
+            pooled[v, i:i + len(x)] = f.mean((2, 3)).cpu().numpy()
+            i += len(x)
+        del loader
+    del features
+    if cfg.device == 'cuda':
+        torch.cuda.empty_cache()
+
+    os.makedirs(os.path.dirname(pooled_path), exist_ok=True)
+    np.savez(pooled_path + '.tmp.npz', X=pooled[0], X_aug=pooled[1:], image=images, meta=meta)
+    os.replace(pooled_path + '.tmp.npz', pooled_path)
+    if maps is not None:
+        maps.flush()
+        with open(maps_path + '.json', 'w', encoding='utf-8') as f:
+            json.dump({'meta': meta, 'image': images.tolist()}, f)
+        maps = np.load(maps_path, mmap_mode='r')
+    print(f'{arch}: features de {N} imágenes × {1 + V} vistas ({dim} dims) → {pooled_path}'
+          + (f'; mapas {maps.shape[3]}×{maps.shape[4]} → {maps_path}' if maps is not None else ''))
+    out = {'X': pooled[0], 'X_aug': pooled[1:], 'maps': maps, 'image': images}
+    _FEATURES[key] = out
+    return out
+
+
+class FeatureBatches:
+    """Lotes (features, etiquetas) desde arrays ya calculados; reemplaza al DataLoader.
+
+    originals: (N, ...) y views: (V, N, ...), o None. Con `views`, cada época toma para cada
+    imagen UNA vista al azar (equivale a la augmentation al vuelo, con V variantes por imagen).
+    """
+
+    def __init__(self, originals, views, idx, labels, batch_size, train, seed=0):
+        self.originals, self.views = originals, views if train else None
+        self.idx, self.labels = np.asarray(idx), torch.tensor(np.array(labels))
+        self.batch_size, self.train = batch_size, train
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return -(-len(self.idx) // self.batch_size)
+
+    def __iter__(self):
+        n = len(self.idx)
+        order = self.rng.permutation(n) if self.train else np.arange(n)
+        for i in range(0, n, self.batch_size):
+            b = order[i:i + self.batch_size]
+            b = b[np.argsort(self.idx[b])]  # en orden de archivo: lectura más secuencial
+            if self.views is not None and len(self.views):
+                x = self.views[self.rng.integers(len(self.views), size=len(b)), self.idx[b]]
+            else:
+                x = self.originals[self.idx[b]]
+            x = torch.from_numpy(np.ascontiguousarray(x))
+            if x.ndim == 2:  # features con pooling → (B, C, 1, 1), como la salida de avgpool
+                x = x[:, :, None, None]
+            yield x, self.labels[b]
+
+
+class HeadOnFeatures(nn.Module):
+    """La cabeza de un experimento, sola. Su state_dict es el mismo que guarda
+    BackboneClassifier.trainable_state(), así que load_trained_model() la carga sin cambios."""
+    freeze = True
+
+    def __init__(self, head: nn.Module):
+        super().__init__()
+        self.head = head
+
+    def forward(self, x):
+        return self.head(x)
+
+    def trainable_state(self):
+        return {k: v.detach().cpu().clone() for k, v in self.head.state_dict().items()}
+
+    def load_trainable_state(self, state):
+        self.head.load_state_dict(state)
+
+
+def build_head(exp, cfg: Config) -> HeadOnFeatures:
+    return HeadOnFeatures(HEADS[exp](FEATURE_DIMS[ARCH_OF_EXP[exp]])).to(cfg.device)
+
+
+def feature_loaders(exp, df: pd.DataFrame, splits: dict, cfg: Config, batch_size: int, seed: int):
+    """Loaders de train/val/test sobre las features precalculadas de `df` (todas las imágenes)."""
+    spatial = exp in SPATIAL_EXPS
+    feats = extract_features(df, ARCH_OF_EXP[exp], cfg, need_maps=spatial)
+    originals, views = (feats['maps'][0], feats['maps'][1:]) if spatial else \
+        (feats['X'], feats['X_aug'])
+    pos = {img: i for i, img in enumerate(feats['image'])}
+    return {name: FeatureBatches(originals, views, s['image'].map(pos).values, s['label'].values,
+                                 batch_size, train=name == 'train', seed=seed)
+            for name, s in splits.items()}
+
+
+# ---------------------------------------------------------------------------
 # Entrenamiento y evaluación
 # ---------------------------------------------------------------------------
 def class_weights(train_df: pd.DataFrame) -> torch.Tensor:
@@ -451,13 +705,20 @@ def class_weights(train_df: pd.DataFrame) -> torch.Tensor:
     return torch.tensor(len(train_df) / (3 * counts), dtype=torch.float32)
 
 
+def _amp(cfg_or_flag, device) -> bool:
+    flag = cfg_or_flag.amp if isinstance(cfg_or_flag, Config) else bool(cfg_or_flag)
+    return flag and str(device).startswith('cuda')
+
+
 @torch.no_grad()
-def predict(model, loader, device):
+def predict(model, loader, device, amp: bool = False):
     model.eval()
     ys, logits = [], []
     for x, y in loader:
-        logits.append(model(x.to(device, dtype=torch.float32)).cpu())
-        ys.append(y)
+        with torch.autocast('cuda', dtype=torch.float16, enabled=_amp(amp, device)):
+            out = model(x.to(device, dtype=torch.float32))
+        logits.append(out.float().cpu())
+        ys.append(torch.as_tensor(y))
     logits = torch.cat(logits)
     y = torch.cat(ys)
     return y.numpy(), logits.argmax(1).numpy(), F.softmax(logits, 1).numpy(), \
@@ -484,19 +745,25 @@ def fit(model, optimizer, train_loader, val_loader, cfg: Config, epochs: int,
     [FIX-11] Guarda la mejor época según cfg.selection_metric y la restaura al final."""
     device = cfg.device
     w = weights.to(device) if weights is not None else None
+    use_amp = _amp(cfg, device)  # [PERF-04]
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     best_score, best_epoch, best_state, history = -np.inf, -1, None, []
     for epoch in range(epochs):
         model.train()
         running, n = 0.0, 0
         for x, y in train_loader:
-            x, y = x.to(device, dtype=torch.float32), y.to(device, dtype=torch.long)
-            loss = F.cross_entropy(model(x), y, weight=w)
+            x = x.to(device, dtype=torch.float32)
+            y = torch.as_tensor(y).to(device, dtype=torch.long)
+            with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
+                logits = model(x)
+            loss = F.cross_entropy(logits.float(), y, weight=w)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             running += loss.item() * len(y)
             n += len(y)
-        y_val, p_val, _, val_loss = predict(model, val_loader, device)
+        y_val, p_val, _, val_loss = predict(model, val_loader, device, use_amp)
         m = compute_metrics(y_val, p_val)
         history.append({'epoch': epoch, 'train_loss': running / n, 'val_loss': val_loss,
                         'val_accuracy': m['accuracy'], 'val_macro_f1': m['macro_f1']})
@@ -523,15 +790,23 @@ def run_optuna(exp, df: pd.DataFrame, cfg: Config, seed: int | None = None, verb
     arch = ARCH_OF_EXP[exp]
     splits = make_splits(df, cfg, seed)
     w = class_weights(splits['train']) if cfg.class_weighted_loss else None
+    cached, tag = uses_feature_cache(exp, cfg), protocol_tag(exp, cfg)
+    if cached:
+        extract_features(df, arch, cfg, need_maps=exp in SPATIAL_EXPS)
 
     def objective(trial):
         lr = trial.suggest_float('lr', *cfg.lr_range, log=True)
         bs = trial.suggest_categorical('batch_size', list(cfg.batch_sizes))
         opt_name = trial.suggest_categorical('optimizer', list(cfg.optimizers))
         set_seed(seed * 1000 + trial.number)
-        model = build_model(exp, cfg)
-        train_loader = make_loader(splits['train'], arch, cfg, bs, train=True, seed=seed)
-        val_loader = make_loader(splits['val'], arch, cfg, bs, train=False)
+        if cached:  # [PERF-03]
+            model = build_head(exp, cfg)
+            ld = feature_loaders(exp, df, splits, cfg, bs, seed * 1000 + trial.number)
+            train_loader, val_loader = ld['train'], ld['val']
+        else:
+            model = build_model(exp, cfg)
+            train_loader = make_loader(splits['train'], arch, cfg, bs, train=True, seed=seed)
+            val_loader = make_loader(splits['val'], arch, cfg, bs, train=False)
         opt = make_optimizer(opt_name, [p for p in model.parameters() if p.requires_grad], lr)
         _, _, best = fit(model, opt, train_loader, val_loader, cfg, cfg.optuna_epochs,
                          weights=w, verbose=verbose)
@@ -545,7 +820,8 @@ def run_optuna(exp, df: pd.DataFrame, cfg: Config, seed: int | None = None, verb
     # Estudio persistente en SQLite: si la sesión se corta, se retoma desde los trials completados.
     storage = f'sqlite:///{os.path.abspath(os.path.join(out, "optuna.db"))}'
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=seed),
-                                study_name=f'exp_{exp}_seed{seed}', storage=storage,
+                                study_name=f'exp_{exp}_seed{seed}' + ('' if tag == 'online' else f'_{tag}'),
+                                storage=storage,
                                 load_if_exists=True)
     done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
     if done:
@@ -560,6 +836,7 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
     """Entrenamiento final con los hiperparámetros elegidos, repetido para cada semilla.
     Evalúa UNA vez en el test fijo (imágenes originales, sin aumentar)."""
     arch = ARCH_OF_EXP[exp]
+    cached_feats, tag = uses_feature_cache(exp, cfg), protocol_tag(exp, cfg)
     results = []
     mdir = os.path.join(cfg.output_dir, 'modelos')
     os.makedirs(mdir, exist_ok=True)
@@ -569,19 +846,25 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
         if os.path.exists(res_path):
             with open(res_path, encoding='utf-8') as f:
                 cached = json.load(f)
-            if cached['params'] == params:
+            # ...y el mismo protocolo (los resultados previos a PERF-03 son 'online')
+            if cached['params'] == params and cached.get('protocol', 'online') == tag:
                 print(f'Experimento {exp}, semilla {seed}: ya entrenado, se carga {res_path}')
                 results.append(cached['metrics'])
                 continue
         set_seed(seed)
         splits = make_splits(df, cfg, seed)
         save_manifest(splits, os.path.join(cfg.output_dir, 'manifiestos', f'split_seed{seed}.csv'))
-        model = build_model(exp, cfg)
-        fp = backbone_fingerprint(model) if model.freeze else None
         bs = params['batch_size']
-        train_loader = make_loader(splits['train'], arch, cfg, bs, train=True, seed=seed)
-        val_loader = make_loader(splits['val'], arch, cfg, bs, train=False)
-        test_loader = make_loader(splits['test'], arch, cfg, bs, train=False)
+        if cached_feats:  # [PERF-03] solo la cabeza, sobre features precalculadas
+            model, fp = build_head(exp, cfg), None
+            ld = feature_loaders(exp, df, splits, cfg, bs, seed)
+            train_loader, val_loader, test_loader = ld['train'], ld['val'], ld['test']
+        else:
+            model = build_model(exp, cfg)
+            fp = backbone_fingerprint(model) if model.freeze else None
+            train_loader = make_loader(splits['train'], arch, cfg, bs, train=True, seed=seed)
+            val_loader = make_loader(splits['val'], arch, cfg, bs, train=False)
+            test_loader = make_loader(splits['test'], arch, cfg, bs, train=False)
         # [FIX-08] El optimizador recibe solo los parámetros entrenables (la cabeza).
         opt = make_optimizer(params['optimizer'],
                              [p for p in model.parameters() if p.requires_grad], params['lr'])
@@ -591,7 +874,7 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
         if fp is not None:
             changed = changed_backbone_tensors(model, fp)
             assert not changed, f'El backbone cambió durante el entrenamiento: {changed[:3]}'
-        y, p, prob, _ = predict(model, test_loader, cfg.device)
+        y, p, prob, _ = predict(model, test_loader, cfg.device, cfg.amp)
         m = compute_metrics(y, p)
         m.update({'exp': str(exp), 'arch': arch, 'seed': seed, 'best_epoch': best_epoch,
                   'n_train': len(splits['train']), 'n_val': len(splits['val']),
@@ -603,7 +886,8 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
         hist.to_csv(os.path.join(mdir, f'history_exp{exp}_seed{seed}.csv'), index=False)
         # Se escribe al final y de forma atómica: su existencia indica que la semilla terminó.
         with open(res_path + '.tmp', 'w', encoding='utf-8') as f:
-            json.dump({'params': params, 'metrics': m}, f, indent=2, default=float)
+            json.dump({'params': params, 'protocol': tag, 'metrics': m}, f, indent=2,
+                      default=float)
         os.replace(res_path + '.tmp', res_path)
         del model
         if cfg.device == 'cuda':
@@ -824,6 +1108,21 @@ def extract_embeddings(df: pd.DataFrame, key: str, cfg: Config, batch_size: int 
     return {'X': X, 'X_aug': X_aug}
 
 
+def fuse_embeddings(embeddings: dict, keys=None) -> dict:
+    """Fusión de varios modelos para un solo linear probe: cada embedding se normaliza a norma 1
+    (para que ningún modelo domine por su escala) y se concatenan. Modelos entrenados de forma
+    distinta (imagen-texto, autosupervisado) cometen errores distintos, y juntos rinden algo más
+    que el mejor por separado. El resultado se usa igual que la salida de extract_embeddings."""
+    keys = list(embeddings) if keys is None else list(keys)
+
+    def unit(a):
+        return a / np.linalg.norm(a, axis=-1, keepdims=True).clip(min=1e-12)
+
+    views = min(len(embeddings[k]['X_aug']) for k in keys)
+    return {'X': np.concatenate([unit(embeddings[k]['X']) for k in keys], -1),
+            'X_aug': np.concatenate([unit(embeddings[k]['X_aug'][:views]) for k in keys], -1)}
+
+
 def _probe(C: float, seed: int):
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
@@ -842,12 +1141,14 @@ def _fit_probe(emb: dict, idx: np.ndarray, y_all: np.ndarray, C: float, seed: in
     return _probe(C, seed).fit(X, y)
 
 
-def _select_C_cv(X, y, cfg: Config, seed: int) -> float:
+def _select_C_cv(X, y, cfg: Config, seed: int, groups=None) -> float:
     """Elige C por CV interna (5 pliegues, solo originales) con la métrica de selección
     calculada sobre las predicciones fuera de pliegue: más estable que un val con 12 negativas."""
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
-    skf = StratifiedKFold(5, shuffle=True, random_state=seed)
-    scores = [compute_metrics(y, cross_val_predict(_probe(C, seed), X, y, cv=skf, n_jobs=-1))
+    from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+    groups = np.arange(len(y)) if groups is None else groups
+    skf = StratifiedGroupKFold(5, shuffle=True, random_state=seed)
+    scores = [compute_metrics(y, cross_val_predict(_probe(C, seed), X, y, cv=skf, groups=groups,
+                                                   n_jobs=-1))
               [cfg.selection_metric] for C in cfg.probe_Cs]
     return cfg.probe_Cs[int(np.argmax(scores))]
 
@@ -879,7 +1180,7 @@ def run_embedding_cv(key: str, emb: dict, df: pd.DataFrame, cfg: Config) -> list
     2.000 imágenes. En cada repetición todas las imágenes (incluidas las 77 Negative) se
     predicen una vez fuera de pliegue; las métricas se calculan por repetición, así que
     summarize() da media ± IC95% sobre repeticiones."""
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold
     path = os.path.join(cfg.output_dir, 'embeddings',
                         f'cv_{key}_v{cfg.embedding_views}_{cfg.cv_repeats}x{cfg.cv_splits}.json')
     if os.path.exists(path):
@@ -887,14 +1188,16 @@ def run_embedding_cv(key: str, emb: dict, df: pd.DataFrame, cfg: Config) -> list
         with open(path, encoding='utf-8') as f:
             return json.load(f)
     y_all = df['label'].values
+    # [FIX-20] las copias de una misma imagen nunca quedan en pliegues distintos
+    groups = df['dup_group'].values if 'dup_group' in df else np.arange(len(df))
     results = []
     for rep in range(cfg.cv_repeats):
         seed = cfg.test_seed + rep
         pred = np.full(len(y_all), -1)
         Cs = []
-        skf = StratifiedKFold(cfg.cv_splits, shuffle=True, random_state=seed)
-        for tr, te in skf.split(emb['X'], y_all):
-            C = _select_C_cv(emb['X'][tr], y_all[tr], cfg, seed)
+        skf = StratifiedGroupKFold(cfg.cv_splits, shuffle=True, random_state=seed)
+        for tr, te in skf.split(emb['X'], y_all, groups):
+            C = _select_C_cv(emb['X'][tr], y_all[tr], cfg, seed, groups[tr])
             pred[te] = _fit_probe(emb, tr, y_all, C, seed).predict(emb['X'][te])
             Cs.append(C)
         m = compute_metrics(y_all, pred)

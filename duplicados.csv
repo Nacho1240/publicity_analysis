@@ -1,0 +1,15 @@
+image_a,image_b,diff,emotion_a,emotion_b,same_valence,same_emotion
+32.jpg,1385.jpg,0.249,Felicidad,Diversión,True,False
+60.jpg,614.jpg,0.139,Indiferencia,Curiosidad,False,False
+319.jpg,385.jpg,0.291,Indiferencia,Indiferencia,True,True
+453.jpg,1095.jpg,0.0,Felicidad,Desagrado,False,False
+516.jpg,1471.jpg,0.0,Felicidad,Felicidad,True,True
+907.jpg,1028.jpg,0.52,Indiferencia,Felicidad,False,False
+907.jpg,1434.jpg,0.224,Indiferencia,Felicidad,False,False
+999.jpg,1478.jpg,0.536,Curiosidad,Indiferencia,False,False
+1003.jpg,1361.jpg,0.087,Felicidad,Felicidad,True,True
+1028.jpg,1434.jpg,0.527,Felicidad,Felicidad,True,True
+1204.jpg,1242.jpg,0.006,Diversión,Curiosidad,True,False
+1216.jpg,1873.jpg,0.178,Felicidad,Felicidad,True,True
+1225.jpg,1941.jpg,0.0,Felicidad,Felicidad,True,True
+1535.jpg,1816.jpg,0.0,Curiosidad,Felicidad,True,False
