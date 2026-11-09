@@ -14,3 +14,6 @@ __pycache__/
 
 # Copia reducida de images_or (pl.prepare_resized_images)
 images_480/
+
+# Mapas de características y resultados locales (PERF-03)
+cache_local/
