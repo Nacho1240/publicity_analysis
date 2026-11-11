@@ -14,3 +14,6 @@ __pycache__/
 
 # Copia reducida de images_or (pl.prepare_resized_images)
 images_480/
+
+# Anuncios descargados con descargar_pitt_ads.py
+images_pitt/
