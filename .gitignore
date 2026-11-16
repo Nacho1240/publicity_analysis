@@ -11,3 +11,13 @@ oasis/Stimulus set/OASIS.zip
 __pycache__/
 .DS_Store
 ~$*
+
+_site
+.bundle
+.sass-cache
+.jekyll-cache
+.jekyll-metadata
+.DS_store
+Gemfile.lock
+.idea
+.zip
