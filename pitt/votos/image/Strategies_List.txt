@@ -1,0 +1,10 @@
+1, Process
+2, Symbol
+3, Atypical
+4, Contrast
+5, Transfer
+6, Culture
+7, Surprise
+8, Human
+9, Literal
+10, Unclear
