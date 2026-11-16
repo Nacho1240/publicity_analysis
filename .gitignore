@@ -18,3 +18,6 @@ images_480/
 # Encuestas originales: contienen nombres reales de los encuestados, no se publican.
 # El notebook 05 las lee desde Drive (MyDrive/publicity_analysis/encuestas/Test_ecuestados/).
 images_or/encuestas/
+
+# Imágenes de las fuentes externas (se generan con los scripts de datos_externos/)
+datos_externos/*/images/
