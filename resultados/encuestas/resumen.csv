@@ -1,0 +1,16 @@
+,valor
+Evaluadores por imagen (mín–máx),3–7
+Respuestas con más de una emoción,10.3%
+α emoción (MASI),0.105
+α valencia 3 clases (nominal),0.138
+α Positive vs. No positivo,0.153
+α Positive vs. Neutral,0.150
+Negative → otros responden Neutral / Positive,35% / 47%
+Etiqueta final con empate en el primer lugar,23.3%
+Valencia final que NO es la más votada,8.1%
+Etiquetas con caracteres invisibles en el CSV,553
+Etiquetas del CSV distintas de la clave (probable error),8 (7)
+Valencia original = más votada (sin empates),91.0%
+Imágenes Negative originales que la encuesta respalda como Negative,48.1%
+Techo 1 evaluador: accuracy (valencia),0.628
+Techo 1 evaluador: macro-F1 (valencia),0.471

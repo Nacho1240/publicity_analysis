@@ -1,0 +1,9 @@
+image,clave_encuesta,etiqueta_csv,votos_clave,votos_etiqueta_csv,votos,probable_error_csv
+23.jpg,Miedo,Felicidad,3,2,"{'Indiferencia': 1, 'Felicidad': 2, 'Diversión': 2, 'Miedo': 3}",True
+48.jpg,Indiferencia,Diversión,5,1,"{'Indiferencia': 5, 'Diversión': 1, 'Desagrado': 2}",True
+49.jpg,Diversión,Indiferencia,4,0,"{'Felicidad': 2, 'Diversión': 4, 'Curiosidad': 2}",True
+54.jpg,Curiosidad,Indiferencia,4,2,"{'Indiferencia': 2, 'Felicidad': 1, 'Diversión': 1, 'Curiosidad': 4}",True
+89.jpg,Indiferencia,Felicidad,2,1,"{'Indiferencia': 2, 'Felicidad': 1, 'Diversión': 3, 'Curiosidad': 2}",True
+264.jpg,Desagrado,Tristeza,3,0,"{'Indiferencia': 1, 'Desagrado': 3, 'Miedo': 2}",True
+508.jpg,Indiferencia,Curiosidad,2,3,"{'Indiferencia': 2, 'Diversión': 1, 'Curiosidad': 3}",False
+794.jpg,Indiferencia,Diversión,3,0,"{'Indiferencia': 3, 'Curiosidad': 2}",True
