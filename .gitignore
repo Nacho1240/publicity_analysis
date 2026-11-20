@@ -12,12 +12,15 @@ __pycache__/
 .DS_Store
 ~$*
 
-# Copia reducida de images_or (pl.prepare_resized_images)
+_site
+.bundle
+.sass-cache
+.jekyll-cache
+.jekyll-metadata
+.DS_store
+Gemfile.lock
+.idea
+.zip
+
+# Copia reducida de images_or (pl.prepare_resized_images, notebook 01)
 images_480/
-
-# Encuestas originales: contienen nombres reales de los encuestados, no se publican.
-# El notebook 05 las lee desde Drive (MyDrive/publicity_analysis/encuestas/Test_ecuestados/).
-images_or/encuestas/
-
-# Imágenes de las fuentes externas (se generan con los scripts de datos_externos/)
-datos_externos/*/images/
